@@ -25,35 +25,72 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  async function send(text: string) {
-    const trimmed = text.trim();
-    if (!trimmed || loading) return;
+  async function send(text: string, isRetry = false) {
+    console.log("[AgentChat] 1. send() invoked. text:", JSON.stringify(text), "isRetry:", isRetry, "current loading:", loading);
 
+    const trimmed = typeof text === "string" ? text.trim() : "";
+    if (!trimmed) {
+      console.warn("[AgentChat] 2. Validation failed: trimmed text is empty. Submission aborted.");
+      return;
+    }
+
+    if (loading) {
+      console.warn("[AgentChat] 2. Submission blocked: loading state is currently true. Concurrent request prevented.");
+      return;
+    }
+
+    console.log("[AgentChat] 3. Validation passed. Updating UI state to loading...");
     setLastPrompt(trimmed);
-    const next: Message[] = [...messages, { role: "user", text: trimmed }];
-    setMessages(next);
-    setInput("");
-    setLoading(true);
     setError("");
+    setLoading(true);
 
-    // Set a client-side timeout so requests never hang indefinitely
+    // Prevent duplicate user bubbles if retrying the same message
+    let next: Message[];
+    const lastMsg = messages[messages.length - 1];
+    if (isRetry && lastMsg && lastMsg.role === "user" && lastMsg.text === trimmed) {
+      console.log("[AgentChat] 4. Reusing existing user message for retry without duplicating.");
+      next = messages;
+    } else {
+      console.log("[AgentChat] 4. Appending new user message to chat history.");
+      next = [...messages, { role: "user", text: trimmed }];
+      setMessages(next);
+    }
+
+    if (!isRetry) {
+      setInput("");
+    }
+
+    // Client-side safety timeout (52s) to prevent browser hangs
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 50000);
+    const timeoutId = setTimeout(() => {
+      console.warn("[AgentChat] 52s client timeout reached; aborting fetch('/api/agent').");
+      controller.abort("Client timeout reached (52s)");
+    }, 52000);
+
+    controller.signal.addEventListener("abort", () => {
+      console.warn("[AgentChat] Fetch signal aborted. Reason:", controller.signal.reason);
+    });
+
+    const payload = {
+      messages: next.slice(-20).map(({ role, text }) => ({ role, text })),
+    };
+
+    console.log("[AgentChat] 5. Prepared POST payload for /api/agent:", JSON.stringify(payload));
+    console.log("[AgentChat] 6. Initiating fetch('/api/agent'). Signal aborted?", controller.signal.aborted);
 
     try {
       const res = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Only the last 20 messages are sent, to keep requests small.
-        body: JSON.stringify({
-          messages: next.slice(-20).map(({ role, text }) => ({ role, text })),
-        }),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
 
+      console.log("[AgentChat] 7. fetch('/api/agent') responded with HTTP status:", res.status, res.statusText);
       clearTimeout(timeoutId);
 
       if (res.status === 401) {
+        console.warn("[AgentChat] Session unauthorized (401). Redirecting to /login...");
         window.location.href = "/login";
         return;
       }
@@ -61,8 +98,9 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
       let data: any = null;
       try {
         data = await res.json();
-      } catch {
-        // Response was not JSON
+        console.log("[AgentChat] 8. Response parsed successfully:", data);
+      } catch (parseErr) {
+        console.error("[AgentChat] 8. Failed to parse response as JSON:", parseErr);
       }
 
       if (!res.ok) {
@@ -70,13 +108,20 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
         try {
           const parsed = JSON.parse(errMsg);
           if (parsed.error?.message) errMsg = parsed.error.message;
-        } catch {}
+        } catch {
+          // not serialized JSON
+        }
+        console.error("[AgentChat] Response not OK. Error message:", errMsg);
         throw new Error(errMsg);
       }
 
       const result = data as AgentResult;
+      console.log("[AgentChat] 9. Success: Model reply received:", result.reply);
       setMessages([...next, { role: "model", text: result.reply, steps: result.steps }]);
+      setLastPrompt(""); // Clear retry prompt upon success
+
       if (result.steps?.some((s) => s.writes && s.ok)) {
+        console.log("[AgentChat] Write tool executed successfully. Triggering onDataChanged...");
         onDataChanged?.();
       }
     } catch (err: unknown) {
@@ -87,15 +132,41 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
         : err instanceof Error
         ? err.message
         : "Something went wrong while contacting the agent.";
+      console.error("[AgentChat] Caught error in send():", message, err);
       setError(message);
     } finally {
       clearTimeout(timeoutId);
+      console.log("[AgentChat] 10. Execution finished. Resetting loading state to false.");
       setLoading(false);
     }
   }
 
+  function handleFormSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    console.log("[AgentChat] Form onSubmit fired. input value:", JSON.stringify(input), "loading:", loading);
+    if (!input.trim()) {
+      console.warn("[AgentChat] Form onSubmit ignored: input is empty or whitespace.");
+      return;
+    }
+    if (loading) {
+      console.warn("[AgentChat] Form onSubmit ignored: already loading.");
+      return;
+    }
+    send(input);
+  }
+
+  function handleSendButtonClick(e: React.MouseEvent<HTMLButtonElement>) {
+    console.log("[AgentChat] Send button onClick fired. input value:", JSON.stringify(input), "loading:", loading);
+    // If the input is valid and not loading, we can trigger submission directly
+    if (input.trim() && !loading) {
+      console.log("[AgentChat] Triggering send from button click handler...");
+      e.preventDefault();
+      send(input);
+    }
+  }
+
   return (
-    <div className="flex h-[70vh] flex-col rounded-xl border border-slate-200 bg-white">
+    <div className="flex h-[70vh] flex-col rounded-xl border border-slate-200 bg-white shadow-sm">
       <div className="border-b border-slate-200 px-4 py-3">
         <h2 className="font-semibold text-slate-800">CampusBite Assistant</h2>
         <p className="text-xs text-slate-500">
@@ -110,8 +181,13 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
             {SAMPLE_PROMPTS.map((p) => (
               <button
                 key={p}
-                onClick={() => send(p)}
-                className="block w-full rounded-lg border border-slate-200 px-3 py-2 text-left text-sm hover:bg-slate-50 transition"
+                type="button"
+                onClick={() => {
+                  console.log("[AgentChat] Sample prompt button clicked:", p);
+                  send(p);
+                }}
+                disabled={loading}
+                className="block w-full rounded-lg border border-slate-200 px-3 py-2 text-left text-sm hover:bg-slate-50 disabled:opacity-50 transition"
               >
                 {p}
               </button>
@@ -124,7 +200,7 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
             <div
               className={
                 m.role === "user"
-                  ? "max-w-[85%] rounded-2xl bg-slate-900 px-3 py-2 text-sm text-white"
+                  ? "max-w-[85%] rounded-2xl bg-slate-900 px-3 py-2 text-sm text-white shadow-sm"
                   : "max-w-[85%] space-y-2"
               }
             >
@@ -148,15 +224,19 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
         )}
 
         {error && (
-          <div className="rounded-lg border border-red-200 bg-red-50 p-2.5 text-xs text-red-700 flex items-center justify-between gap-2">
-            <span>{error}</span>
+          <div className="rounded-lg border border-red-200 bg-red-50 p-2.5 text-xs text-red-700 flex items-center justify-between gap-2 shadow-xs">
+            <span className="flex-1">{error}</span>
             {lastPrompt && (
               <button
                 type="button"
-                onClick={() => send(lastPrompt)}
-                className="rounded bg-red-100 px-2.5 py-1 font-medium text-red-800 hover:bg-red-200 transition text-[11px]"
+                onClick={() => {
+                  console.log("[AgentChat] Retry button clicked with lastPrompt:", lastPrompt);
+                  send(lastPrompt, true);
+                }}
+                disabled={loading}
+                className="rounded bg-red-100 px-2.5 py-1 font-medium text-red-800 hover:bg-red-200 disabled:opacity-50 transition text-[11px] whitespace-nowrap"
               >
-                Retry
+                {loading ? "Retrying..." : "Retry"}
               </button>
             )}
           </div>
@@ -166,24 +246,23 @@ export default function AgentChat({ onDataChanged }: { onDataChanged?: () => voi
       </div>
 
       <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          send(input);
-        }}
+        onSubmit={handleFormSubmit}
         className="flex gap-2 border-t border-slate-200 p-3"
       >
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask for food, check wallet, or place order..."
-          className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500"
+          disabled={loading}
+          placeholder={loading ? "Agent is processing your request..." : "Ask for food, check wallet, or place order..."}
+          className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 disabled:bg-slate-50 disabled:text-slate-400"
         />
         <button
           type="submit"
+          onClick={handleSendButtonClick}
           disabled={loading || !input.trim()}
           className="rounded-lg bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-50 transition hover:bg-slate-800"
         >
-          Send
+          {loading ? "Working..." : "Send"}
         </button>
       </form>
     </div>
